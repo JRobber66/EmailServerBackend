@@ -11,7 +11,7 @@ const cron = require("node-cron");
 const { z } = require("zod");
 
 // ---------- ENV ----------
-const PORT = process.env.PORT || 3000; // Railway provides PORT dynamically; don't set it manually
+const PORT = process.env.PORT || 3000; // Railway provides PORT dynamically
 const HOST = "0.0.0.0";
 
 const SERVICE_KEY = process.env.SERVICE_KEY || "";
@@ -22,7 +22,7 @@ const AGENT_PSK_B64 = process.env.AGENT_PSK_B64 || "";
 const MAIL_DOMAIN = process.env.MAIL_DOMAIN || "local";
 
 // Boot diagnostics (no secrets)
-console.log("[BOOT] PORT=%s HOST=%s MAIL_DOMAIN=%s", PORT, HOST, MAIL_DOMAIN);
+console.log("[BOOT] HOST=%s PORT=%s MAIL_DOMAIN=%s", HOST, PORT, MAIL_DOMAIN);
 console.log("[BOOT] SERVICE_KEY set? %s", SERVICE_KEY ? "yes" : "NO");
 console.log("[BOOT] AGENT_URL=%s", AGENT_URL || "(missing)");
 console.log("[BOOT] AGENT_KEY set? %s", AGENT_KEY ? "yes" : "no");
@@ -49,6 +49,7 @@ app.use("/api", rateLimit({ windowMs: 60_000, max: 60, standardHeaders: true, le
 // quick root check
 app.get("/", (_req, res) => res.type("text").send("ok"));
 
+// auth
 function requireServiceKey(req, res, next) {
   const key = req.headers["x-service-key"];
   if (!key || key !== SERVICE_KEY) return res.status(401).json({ error: "unauthorized" });
@@ -83,7 +84,7 @@ async function ensureDB() {
   return db;
 }
 
-// ---------- CRYPTO ----------
+// ---------- CRYPTO & AGENT CALL ----------
 function encryptJSON(obj) {
   if (!AGENT_PSK) throw new Error("server not fully configured (AGENT_PSK)");
   const iv = crypto.randomBytes(12);
@@ -96,17 +97,34 @@ function encryptJSON(obj) {
 
 async function callAgent(op, payload) {
   if (!AGENT_URL) throw new Error("server not fully configured (AGENT_URL)");
+
   const envelope = encryptJSON({ op, payload, ts: Date.now() });
-  const r = await fetch(`${AGENT_URL}/agent`, {
-    method: "POST",
-    headers: { "content-type": "application/json", ...(AGENT_KEY ? { "x-agent-key": AGENT_KEY } : {}) },
-    body: JSON.stringify(envelope),
-  });
-  if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    throw new Error(`Agent ${r.status}: ${text || "no body"}`);
+
+  // 12s timeout to avoid long hangs
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);
+
+  try {
+    const r = await fetch(`${AGENT_URL}/agent`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(AGENT_KEY ? { "x-agent-key": AGENT_KEY } : {})
+      },
+      body: JSON.stringify(envelope),
+      signal: controller.signal
+    });
+    if (!r.ok) {
+      const text = await r.text().catch(() => "");
+      throw new Error(`Agent ${r.status}: ${text || "no body"}`);
+    }
+    return await r.json();
+  } catch (e) {
+    if (e.name === "AbortError") throw new Error("Agent timeout (no response in 12s)");
+    throw e;
+  } finally {
+    clearTimeout(timer);
   }
-  return r.json();
 }
 
 // ---------- SCHEMAS ----------
@@ -223,6 +241,7 @@ app.get("/api/admin/temp-accounts", requireServiceKey, async (_req, res) => {
   res.json(rows);
 });
 
+// Cleanup cron
 cron.schedule("*/5 * * * *", async () => {
   try {
     const _db = await ensureDB();
@@ -243,6 +262,7 @@ cron.schedule("*/5 * * * *", async () => {
   }
 });
 
+// 404
 app.use((_req, res) => res.status(404).json({ error: "not found" }));
 
 app.listen(PORT, HOST, () => console.log(`API listening on ${HOST}:${PORT}`));
