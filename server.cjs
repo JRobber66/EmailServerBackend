@@ -1,4 +1,6 @@
-// server.cjs — boot-safe (no native loads), AES-256-GCM to agent, inbox/message w/ password
+// server.cjs — Railway backend
+// Env required: SERVICE_KEY, AGENT_URL, AGENT_PSK_B64, MAIL_DOMAIN
+// Optional: AGENT_KEY, FRONTEND_ORIGIN
 
 const express = require("express");
 const helmet = require("helmet");
@@ -9,7 +11,9 @@ const cron = require("node-cron");
 const { z } = require("zod");
 
 // ---------- ENV ----------
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000; // Railway provides PORT dynamically; don't set it manually
+const HOST = "0.0.0.0";
+
 const SERVICE_KEY = process.env.SERVICE_KEY || "";
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "";
 const AGENT_URL = process.env.AGENT_URL || "";
@@ -17,14 +21,14 @@ const AGENT_KEY = process.env.AGENT_KEY || "";
 const AGENT_PSK_B64 = process.env.AGENT_PSK_B64 || "";
 const MAIL_DOMAIN = process.env.MAIL_DOMAIN || "local";
 
-// Boot log (safe; no secrets)
-console.log("[BOOT] PORT=%s, FRONTEND_ORIGIN=%s, MAIL_DOMAIN=%s", PORT, FRONTEND_ORIGIN || "(any)", MAIL_DOMAIN);
+// Boot diagnostics (no secrets)
+console.log("[BOOT] PORT=%s HOST=%s MAIL_DOMAIN=%s", PORT, HOST, MAIL_DOMAIN);
 console.log("[BOOT] SERVICE_KEY set? %s", SERVICE_KEY ? "yes" : "NO");
 console.log("[BOOT] AGENT_URL=%s", AGENT_URL || "(missing)");
 console.log("[BOOT] AGENT_KEY set? %s", AGENT_KEY ? "yes" : "no");
 console.log("[BOOT] AGENT_PSK_B64 set? %s", AGENT_PSK_B64 ? "yes" : "NO");
 
-// Validate PSK (but don’t crash boot)
+// Validate PSK (don’t crash if bad; routes will 400)
 let AGENT_PSK = null;
 try {
   const buf = Buffer.from(AGENT_PSK_B64 || "", "base64");
@@ -39,13 +43,11 @@ const app = express();
 app.set("trust proxy", 1);
 app.use(helmet({ crossOriginEmbedderPolicy: false }));
 app.use(express.json({ limit: "512kb" }));
-app.use(
-  cors({ origin: FRONTEND_ORIGIN ? [FRONTEND_ORIGIN] : true, credentials: false })
-);
-app.use(
-  "/api",
-  rateLimit({ windowMs: 60_000, max: 60, standardHeaders: true, legacyHeaders: false })
-);
+app.use(cors({ origin: FRONTEND_ORIGIN ? [FRONTEND_ORIGIN] : true, credentials: false }));
+app.use("/api", rateLimit({ windowMs: 60_000, max: 60, standardHeaders: true, legacyHeaders: false }));
+
+// quick root check
+app.get("/", (_req, res) => res.type("text").send("ok"));
 
 function requireServiceKey(req, res, next) {
   const key = req.headers["x-service-key"];
@@ -53,13 +55,12 @@ function requireServiceKey(req, res, next) {
   next();
 }
 
-// ---------- LAZY DB (no native require on boot) ----------
+// ---------- LAZY DB (no native loads at boot) ----------
 let db = null;
 let dbReady = false;
 async function ensureDB() {
   if (dbReady) return db;
   try {
-    // Lazy import to avoid native load at boot
     const { open } = require("sqlite");
     const sqlite3 = require("sqlite3");
     db = await open({ filename: "./data.db", driver: sqlite3.Database });
@@ -76,8 +77,8 @@ async function ensureDB() {
     dbReady = true;
     console.log("[DB] ready");
   } catch (e) {
-    console.error("[DB] init error; continuing without persistence:", e.message);
-    db = null; dbReady = true; // mark as tried; run without DB
+    console.error("[DB] init error; running without persistence:", e.message);
+    db = null; dbReady = true;
   }
   return db;
 }
@@ -180,10 +181,8 @@ app.post("/api/delete-account", requireServiceKey, async (req, res) => {
   try {
     const { mailbox } = delSchema.parse(req.body || {});
     await callAgent("deleteAccount", { mailbox });
-
     const _db = await ensureDB();
     if (_db) await _db.run("DELETE FROM temp_accounts WHERE mailbox = ?", mailbox);
-
     res.json({ ok: true });
   } catch (e) {
     console.error("[/api/delete-account] %s", e.message);
@@ -246,4 +245,4 @@ cron.schedule("*/5 * * * *", async () => {
 
 app.use((_req, res) => res.status(404).json({ error: "not found" }));
 
-app.listen(PORT, () => console.log(`API listening on :${PORT}`));
+app.listen(PORT, HOST, () => console.log(`API listening on ${HOST}:${PORT}`));
