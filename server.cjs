@@ -1,5 +1,6 @@
-// server.cjs — Plain login backend with cross-site session cookie (SameSite=None)
-// CORS + cookie-based session backend for your refnull.net frontend.
+// server.cjs — Plain login backend (NO DEMO FALLBACKS)
+// - Cookies: SameSite=None; Secure (works with refnull.net frontend)
+// - Errors: 401 invalid creds; 502 home unavailable; 504 home timeout
 
 'use strict';
 
@@ -14,26 +15,24 @@ const cookie = require('cookie');
 
 // ================= CONFIG =================
 const FRONTEND_ORIGIN = 'https://refnull.net';
-const SESSION_TTL_SECONDS = 86400; // 1 day
+const SESSION_TTL_SECONDS = 86400;
 const PORT = 8080;
 
-// Home PC connector
 const HOME_HOST = '98.156.77.218';
 const HOME_PORT = 31001;
-const HOME_REPLY_PORT = undefined; // leave undefined for single full-duplex port
+const HOME_REPLY_PORT = undefined;
+const HOME_RPC_TIMEOUT_MS = 5000; // shorter, fail fast
 
-// Pre-shared key for light encryption (AES-256-GCM). Replace with your own.
+// PSK must match your home agent
 const HOME_PSK_BASE64 = 'PUy9rgQrk7jZqRY5g8FqQBG901FOwrflcYHeruqRWcI=';
 let HOME_PSK = null;
 try {
   const buf = Buffer.from(HOME_PSK_BASE64, 'base64');
   if (buf.length === 32) HOME_PSK = buf;
-  else console.warn('HOME_PSK_BASE64 must decode to 32 bytes (got', buf.length, ')');
-} catch {
-  console.warn('Invalid HOME_PSK_BASE64');
-}
+  else console.warn('HOME_PSK must be 32 bytes (base64 decoded), got', buf.length);
+} catch { console.warn('Invalid HOME_PSK_BASE64'); }
 
-// ================= SESSION STORAGE =================
+// ================= SESSIONS =================
 const sessions = new Map(); // sessId -> { email, name, exp }
 setInterval(() => {
   const now = Math.floor(Date.now() / 1000);
@@ -42,11 +41,10 @@ setInterval(() => {
 
 // ================= HELPERS =================
 function setSessCookie(res, sessId, maxAgeSeconds) {
-  // Cross-site cookie fix: SameSite=None allows frontend on refnull.net to send it
   const c = cookie.serialize('sess', sessId, {
     httpOnly: true,
     secure: true,
-    sameSite: 'none',
+    sameSite: 'none',   // cross-site cookie
     path: '/',
     maxAge: maxAgeSeconds,
   });
@@ -67,32 +65,25 @@ function requireAuth(req, res, next) {
 
 // ================= CORS =================
 const corsOpts = {
-  origin: (origin, cb) => {
-    if (!origin || origin === FRONTEND_ORIGIN) return cb(null, true);
-    cb(new Error('CORS blocked'));
-  },
+  origin: (origin, cb) => { if (!origin || origin === FRONTEND_ORIGIN) return cb(null, true); cb(new Error('CORS blocked')); },
   credentials: true,
-  methods: ['GET', 'POST', 'OPTIONS'],
+  methods: ['GET','POST','OPTIONS'],
   allowedHeaders: ['content-type'],
 };
 
-// ================= HOME CONNECTOR =================
+// ================= HOME CONNECTOR (framed RPC over TCP) =================
 let homeSocket = null, homeReplySocket = null;
 let rpcCounter = 0;
 const pendingRPC = new Map();
 
 function makeFrame(obj) {
   const json = Buffer.from(JSON.stringify(obj), 'utf8');
-  if (!HOME_PSK) {
-    const len = Buffer.alloc(4); len.writeUInt32BE(json.length, 0);
-    return Buffer.concat([len, json]);
-  }
+  if (!HOME_PSK) { const len = Buffer.alloc(4); len.writeUInt32BE(json.length, 0); return Buffer.concat([len, json]); }
   const nonce = crypto.randomBytes(12);
   const c = crypto.createCipheriv('aes-256-gcm', HOME_PSK, nonce);
   const enc = Buffer.concat([c.update(json), c.final()]);
   const tag = c.getAuthTag();
-  const packed = Buffer.concat([nonce, tag, enc]);
-  const len = Buffer.alloc(4); len.writeUInt32BE(packed.length, 0);
+  const packed = Buffer.concat([nonce, tag, enc]); const len = Buffer.alloc(4); len.writeUInt32BE(packed.length, 0);
   return Buffer.concat([len, packed]);
 }
 function parseFrames(buf, onMessage) {
@@ -104,11 +95,8 @@ function parseFrames(buf, onMessage) {
     let jsonBuf;
     if (!HOME_PSK) jsonBuf = chunk;
     else {
-      const nonce = chunk.subarray(0, 12);
-      const tag = chunk.subarray(12, 28);
-      const enc = chunk.subarray(28);
-      const d = crypto.createDecipheriv('aes-256-gcm', HOME_PSK, nonce);
-      d.setAuthTag(tag);
+      const nonce = chunk.subarray(0,12), tag = chunk.subarray(12,28), enc = chunk.subarray(28);
+      const d = crypto.createDecipheriv('aes-256-gcm', HOME_PSK, nonce); d.setAuthTag(tag);
       jsonBuf = Buffer.concat([d.update(enc), d.final()]);
     }
     onMessage(JSON.parse(jsonBuf.toString('utf8')));
@@ -117,9 +105,7 @@ function parseFrames(buf, onMessage) {
 }
 function connectHomeSockets() {
   const connectOne = (port, label) => {
-    const sock = net.createConnection({ host: HOME_HOST, port }, () => {
-      console.log(`[home] connected ${label} ${HOME_HOST}:${port}`);
-    });
+    const sock = net.createConnection({ host: HOME_HOST, port }, () => console.log(`[home] connected ${label} ${HOME_HOST}:${port}`));
     sock.setKeepAlive(true, 20_000);
     let buffer = Buffer.alloc(0);
     sock.on('data', (d) => {
@@ -127,64 +113,58 @@ function connectHomeSockets() {
       buffer = parseFrames(buffer, (msg) => {
         if (msg.kind === 'rpc.res' && typeof msg.id !== 'undefined') {
           const ent = pendingRPC.get(msg.id);
-          if (ent) {
-            clearTimeout(ent.timer);
-            pendingRPC.delete(msg.id);
-            msg.error ? ent.reject(new Error(msg.error)) : ent.resolve(msg.result);
-          }
+          if (ent) { clearTimeout(ent.timer); pendingRPC.delete(msg.id); msg.error ? ent.reject(new Error(msg.error)) : ent.resolve(msg.result); }
         }
       });
     });
-    sock.on('error', (e) => console.warn(`[home] ${label} error:`, e.message));
-    sock.on('close', () => {
-      console.warn(`[home] ${label} closed. retrying in 3s`);
-      setTimeout(connectHomeSockets, 3000);
-    });
+    sock.on('error', (e) => console.warn(`[home] ${label} error: ${e.message}`));
+    sock.on('close', () => { console.warn(`[home] ${label} closed. retrying in 3s`); setTimeout(connectHomeSockets, 3000); });
     return sock;
   };
   homeSocket = connectOne(HOME_PORT, 'main');
   if (HOME_REPLY_PORT) homeReplySocket = connectOne(HOME_REPLY_PORT, 'reply');
 }
+function homeConnected() {
+  return homeSocket && !homeSocket.destroyed;
+}
 function homeRPC(method, params) {
   return new Promise((resolve, reject) => {
-    if (!homeSocket || homeSocket.destroyed) return reject(new Error('home socket not connected'));
+    if (!homeConnected()) return reject(new Error('home socket not connected'));
     const id = ++rpcCounter;
     const frame = makeFrame({ kind: 'rpc.req', id, method, params });
-    const timer = setTimeout(() => {
-      pendingRPC.delete(id);
-      reject(new Error('home rpc timeout'));
-    }, 10_000);
+    const timer = setTimeout(() => { pendingRPC.delete(id); reject(new Error('home rpc timeout')); }, HOME_RPC_TIMEOUT_MS);
     pendingRPC.set(id, { resolve, reject, timer });
     (homeReplySocket && !homeReplySocket.destroyed ? homeReplySocket : homeSocket).write(frame);
   });
 }
 
-// ================= EXPRESS APP =================
+// ================= APP =================
 const app = express();
 app.disable('x-powered-by');
-app.use(helmet({
-  crossOriginOpenerPolicy: { policy: 'same-origin' },
-  crossOriginResourcePolicy: { policy: 'same-origin' },
-}));
+app.use(helmet({ crossOriginOpenerPolicy: { policy: 'same-origin' }, crossOriginResourcePolicy: { policy: 'same-origin' } }));
 app.use(morgan('tiny'));
-app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
+app.use((req,res,next)=>{ res.setHeader('Vary','Origin'); next(); });
 app.use(cors(corsOpts));
 app.use(express.json({ limit: '256kb' }));
 
-// ================= ROUTES =================
+// Health for the connector
+app.get('/home/status', (req, res) => {
+  res.json({ connected: homeConnected(), host: HOME_HOST, port: HOME_PORT, pending: pendingRPC.size });
+});
+
+// ---------- AUTH (NO DEMO) ----------
 app.post('/api/auth/login-plain', async (req, res) => {
   try {
     const { email, password } = req.body || {};
-    if (!email || typeof password !== 'string' || !password)
-      return res.status(400).json({ error: 'bad request' });
+    if (!email || typeof password !== 'string' || !password) return res.status(400).json({ error: 'bad request' });
+    if (!homeConnected()) return res.status(502).json({ error: 'home unavailable' });
 
     let userRecord;
     try {
       userRecord = await homeRPC('auth.verify', { email, password });
     } catch (e) {
-      console.warn('[auth.verify] homeRPC failed, demo fallback:', e.message);
-      if (password.length < 3) return res.status(401).json({ error: 'invalid credentials' });
-      userRecord = { email, name: email.split('@')[0] };
+      if (e.message.includes('timeout')) return res.status(504).json({ error: 'home timeout' });
+      return res.status(401).json({ error: 'invalid credentials' });
     }
 
     const sessId = crypto.randomBytes(24).toString('base64url');
@@ -198,67 +178,45 @@ app.post('/api/auth/login-plain', async (req, res) => {
   }
 });
 
-app.get('/api/me', requireAuth, (req, res) => {
-  res.json({ email: req.user.email, name: req.user.name });
-});
+app.get('/api/me', requireAuth, (req, res) => res.json({ email: req.user.email, name: req.user.name }));
 
+// ---------- MAIL (NO DEMO) ----------
 app.get('/api/mail/messages', requireAuth, async (req, res) => {
+  if (!homeConnected()) return res.status(502).json({ error: 'home unavailable' });
   const folder = (req.query.folder || 'inbox').toString();
   const q = (req.query.q || '').toString();
   const page = parseInt((req.query.page || '1').toString(), 10);
   try {
-    let items;
-    try {
-      items = await homeRPC('imap.list', { folder, q, page, who: req.user.email });
-    } catch (e) {
-      console.warn('[imap.list] homeRPC failed:', e.message);
-      items = [
-        { id: 'demo1', from: 'Alice <alice@example.com>', subject: 'Hello Demo', snippet: 'This is demo mail', date: new Date().toISOString() },
-      ];
-    }
+    const items = await homeRPC('imap.list', { folder, q, page, who: req.user.email });
     res.json({ items, nextPage: page + 1 });
   } catch (e) {
-    res.status(500).json({ error: 'server error' });
+    if (e.message.includes('timeout')) return res.status(504).json({ error: 'home timeout' });
+    res.status(502).json({ error: 'home error', detail: e.message });
   }
 });
 
 app.get('/api/mail/messages/:id', requireAuth, async (req, res) => {
+  if (!homeConnected()) return res.status(502).json({ error: 'home unavailable' });
   const id = req.params.id;
   try {
-    let msg;
-    try {
-      msg = await homeRPC('imap.get', { id, who: req.user.email });
-    } catch (e) {
-      console.warn('[imap.get] homeRPC failed:', e.message);
-      msg = {
-        id,
-        from: 'Alice <alice@example.com>',
-        to: [req.user.email],
-        subject: 'Demo message',
-        date: new Date().toISOString(),
-        body: 'Plain demo body (no IMAP connected).',
-      };
-    }
+    const msg = await homeRPC('imap.get', { id, who: req.user.email });
     res.json(msg);
   } catch (e) {
-    res.status(500).json({ error: 'server error' });
+    if (e.message.includes('timeout')) return res.status(504).json({ error: 'home timeout' });
+    res.status(502).json({ error: 'home error', detail: e.message });
   }
 });
 
 app.post('/api/mail/send', requireAuth, async (req, res) => {
+  if (!homeConnected()) return res.status(502).json({ error: 'home unavailable' });
   const { to, subject, body } = req.body || {};
   if (!to || typeof to !== 'string') return res.status(400).json({ error: 'invalid to' });
   try {
-    let result;
-    try {
-      result = await homeRPC('smtp.send', { from: req.user.email, to, subject, body });
-    } catch (e) {
-      console.warn('[smtp.send] homeRPC failed:', e.message);
-      result = { ok: true, id: 'sent_' + Date.now() };
-    }
-    res.json(result.ok ? result : { ok: false, error: result.error || 'send failed' });
+    const result = await homeRPC('smtp.send', { from: req.user.email, to, subject, body });
+    res.json(result);
   } catch (e) {
-    res.status(500).json({ error: 'server error' });
+    if (e.message.includes('timeout')) return res.status(504).json({ error: 'home timeout' });
+    res.status(502).json({ error: 'home error', detail: e.message });
   }
 });
 
@@ -273,5 +231,5 @@ app.get('/healthz', (req, res) => res.json({ ok: true }));
 // ================= START =================
 connectHomeSockets();
 http.createServer(app).listen(PORT, () => {
-  console.log(`refnull mail API running on port ${PORT}`);
+  console.log(`refnull mail API (no-demo) on ${PORT}`);
 });
