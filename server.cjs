@@ -1,5 +1,6 @@
 'use strict';
 
+// ===== deps =====
 const http = require('http');
 const crypto = require('crypto');
 const net = require('net');
@@ -8,19 +9,19 @@ const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const cookie = require('cookie');
-const { v4: uuidv4 } = require('uuid');
-const { exportJWK, generateKeyPair } = require('jose');
 
-// ================= CONFIG =================
+// ===== config (hardcoded to your setup) =====
 const FRONTEND_ORIGIN = 'https://refnull.net';
-const SESSION_TTL_SECONDS = 86400;
+const SESSION_TTL_SECONDS = 86400; // 1 day
 const PORT = 8080;
 
+// Home PC connector (single full-duplex TCP)
 const HOME_HOST = '98.156.77.218';
 const HOME_PORT = 31001;
-const HOME_REPLY_PORT = undefined;
-const HOME_PSK_BASE64 = 'PUy9rgQrk7jZqRY5g8FqQBG901FOwrflcYHeruqRWcI=';
+const HOME_REPLY_PORT = undefined;                  // keep undefined to stay single-port
+const HOME_PSK_BASE64 = 'PUy9rgQrk7jZqRY5g8FqQBG901FOwrflcYHeruqRWcI='; // 32-byte base64 PSK for light framing encryption
 
+// ===== PSK handling =====
 let HOME_PSK = null;
 try {
   const buf = Buffer.from(HOME_PSK_BASE64, 'base64');
@@ -30,34 +31,14 @@ try {
   console.warn('Invalid HOME_PSK_BASE64');
 }
 
-// ================= SESSION STORAGE =================
-const sessions = new Map();
-const noncesSeen = new Set();
+// ===== in-memory stores =====
+const sessions = new Map();  // sessId -> { email, name, exp }
 setInterval(() => {
   const now = Math.floor(Date.now() / 1000);
   for (const [k, v] of sessions.entries()) if (v.exp <= now) sessions.delete(k);
-  if (noncesSeen.size > 5000) noncesSeen.clear();
 }, 60_000);
 
-// ================= RSA KEY (JWKS) =================
-let keyPair, jwkPub, jwks, kid;
-async function initKeys() {
-  keyPair = await generateKeyPair('RSA-OAEP-256', { modulusLength: 2048 });
-  jwkPub = await exportJWK(keyPair.publicKey);
-  kid = crypto.createHash('sha256')
-    .update(Buffer.from(JSON.stringify(jwkPub)))
-    .digest('base64url')
-    .slice(0, 16);
-  jwkPub.use = 'enc';
-  jwkPub.alg = 'RSA-OAEP-256';
-  jwkPub.kid = kid;
-  jwks = { keys: [jwkPub] };
-}
-
-// ================= HELPERS =================
-function b64urlToBuf(b64u) {
-  return Buffer.from(b64u.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
-}
+// ===== helpers =====
 function setSessCookie(res, sessId, maxAgeSeconds) {
   const c = cookie.serialize('sess', sessId, {
     httpOnly: true,
@@ -75,14 +56,13 @@ function requireAuth(req, res, next) {
   const { sess } = parseCookies(req);
   if (!sess) return res.status(401).json({ error: 'unauthorized' });
   const rec = sessions.get(sess);
-  if (!rec || rec.exp <= Math.floor(Date.now() / 1000))
-    return res.status(401).json({ error: 'unauthorized' });
+  if (!rec || rec.exp <= Math.floor(Date.now() / 1000)) return res.status(401).json({ error: 'unauthorized' });
   req.user = { email: rec.email, name: rec.name };
   req.sessId = sess;
   next();
 }
 
-// ================= CORS =================
+// ===== CORS =====
 const corsOpts = {
   origin: (origin, cb) => {
     if (!origin || origin === FRONTEND_ORIGIN) return cb(null, true);
@@ -93,38 +73,32 @@ const corsOpts = {
   allowedHeaders: ['content-type'],
 };
 
-// ================= HOME CONNECTOR =================
+// ===== Home connector (framing + RPC) =====
 let homeSocket = null, homeReplySocket = null;
 let rpcCounter = 0;
-const pendingRPC = new Map();
+const pendingRPC = new Map(); // id -> { resolve, reject, timer }
 
 function makeFrame(obj) {
   const json = Buffer.from(JSON.stringify(obj), 'utf8');
   if (!HOME_PSK) {
-    const len = Buffer.alloc(4);
-    len.writeUInt32BE(json.length, 0);
+    const len = Buffer.alloc(4); len.writeUInt32BE(json.length, 0);
     return Buffer.concat([len, json]);
   }
   const nonce = crypto.randomBytes(12);
   const c = crypto.createCipheriv('aes-256-gcm', HOME_PSK, nonce);
   const enc = Buffer.concat([c.update(json), c.final()]);
   const tag = c.getAuthTag();
-  const packed = Buffer.concat([nonce, tag, enc]);
-  const len = Buffer.alloc(4);
-  len.writeUInt32BE(packed.length, 0);
-  return Buffer.concat([len, packed]);
+  const pack = Buffer.concat([nonce, tag, enc]); // 12 + 16 + enc
+  const len = Buffer.alloc(4); len.writeUInt32BE(pack.length, 0);
+  return Buffer.concat([len, pack]);
 }
-function parseFrames(buf, onMessage) {
+function parseFrames(buf, onMsg) {
   let off = 0;
   while (buf.length - off >= 4) {
-    const len = buf.readUInt32BE(off);
-    off += 4;
-    if (buf.length - off < len) {
-      off -= 4;
-      break;
-    }
-    const chunk = buf.subarray(off, off + len);
-    off += len;
+    const len = buf.readUInt32BE(off); off += 4;
+    if (buf.length - off < len) { off -= 4; break; }
+    const chunk = buf.subarray(off, off + len); off += len;
+
     let jsonBuf;
     if (!HOME_PSK) jsonBuf = chunk;
     else {
@@ -135,15 +109,15 @@ function parseFrames(buf, onMessage) {
       d.setAuthTag(tag);
       jsonBuf = Buffer.concat([d.update(enc), d.final()]);
     }
-    onMessage(JSON.parse(jsonBuf.toString('utf8')));
+    onMsg(JSON.parse(jsonBuf.toString('utf8')));
   }
   return buf.subarray(off);
 }
 function connectHomeSockets() {
   const connectOne = (port, label) => {
-    const sock = net.createConnection({ host: HOME_HOST, port }, () =>
-      console.log(`[home] connected ${label} ${HOME_HOST}:${port}`)
-    );
+    const sock = net.createConnection({ host: HOME_HOST, port }, () => {
+      console.log(`[home] connected ${label} ${HOME_HOST}:${port}`);
+    });
     sock.setKeepAlive(true, 20_000);
     let buffer = Buffer.alloc(0);
     sock.on('data', (d) => {
@@ -171,8 +145,7 @@ function connectHomeSockets() {
 }
 function homeRPC(method, params) {
   return new Promise((resolve, reject) => {
-    if (!homeSocket || homeSocket.destroyed)
-      return reject(new Error('home socket not connected'));
+    if (!homeSocket || homeSocket.destroyed) return reject(new Error('home socket not connected'));
     const id = ++rpcCounter;
     const frame = makeFrame({ kind: 'rpc.req', id, method, params });
     const timer = setTimeout(() => {
@@ -180,92 +153,56 @@ function homeRPC(method, params) {
       reject(new Error('home rpc timeout'));
     }, 10_000);
     pendingRPC.set(id, { resolve, reject, timer });
-    (homeReplySocket && !homeReplySocket.destroyed
-      ? homeReplySocket
-      : homeSocket
-    ).write(frame);
+    (homeReplySocket && !homeReplySocket.destroyed ? homeReplySocket : homeSocket).write(frame);
   });
 }
 
-// ================= EXPRESS APP =================
+// ===== express app =====
 const app = express();
 app.disable('x-powered-by');
-app.use(
-  helmet({
-    crossOriginOpenerPolicy: { policy: 'same-origin' },
-    crossOriginResourcePolicy: { policy: 'same-origin' },
-  })
-);
+app.use(helmet({
+  crossOriginOpenerPolicy: { policy: 'same-origin' },
+  crossOriginResourcePolicy: { policy: 'same-origin' },
+}));
 app.use(morgan('tiny'));
-app.use((req, res, next) => {
-  res.setHeader('Vary', 'Origin');
-  next();
-});
+app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
 app.use(cors(corsOpts));
 app.use(express.json({ limit: '256kb' }));
 
-// ================= ROUTES =================
-app.get('/.well-known/jwks.json', (req, res) => res.json(jwks));
+// ===== routes =====
 
-app.post('/api/auth/login-encrypted', async (req, res) => {
+// Plain JSON login (no encryption)
+app.post('/api/auth/login-plain', async (req, res) => {
   try {
-    const { ciphertext, kid: kidFromClient, nonce } = req.body || {};
-    if (!ciphertext || !kidFromClient || !nonce)
-      return res.status(400).json({ error: 'bad request' });
-    if (kidFromClient !== kid)
-      return res.status(400).json({ error: 'unknown kid' });
-    if (noncesSeen.has(nonce))
-      return res.status(409).json({ error: 'nonce replay' });
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: 'missing email or password' });
 
-    const ct = b64urlToBuf(ciphertext);
-    const decrypted = crypto.privateDecrypt(
-      {
-        key: keyPair.privateKey.export({ type: 'pkcs8', format: 'pem' }),
-        padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-        oaepHash: 'sha256',
-      },
-      ct
-    );
-
-    const payload = JSON.parse(decrypted.toString('utf8'));
-    const { email, password, nonce: innerNonce, ts } = payload;
-    if (!email || !password || !innerNonce || !ts)
-      return res.status(400).json({ error: 'invalid payload' });
-    if (innerNonce !== nonce)
-      return res.status(400).json({ error: 'nonce mismatch' });
-    if (Math.abs(Date.now() - ts) > 2 * 60 * 1000)
-      return res.status(401).json({ error: 'stale timestamp' });
-
-    noncesSeen.add(nonce);
-
+    // Ask the home agent; fallback allows any password length >= 6
     let userRecord;
     try {
       userRecord = await homeRPC('auth.verify', { email, password });
     } catch (e) {
-      console.warn('[auth] homeRPC failed, demo fallback:', e.message);
-      if (typeof password !== 'string' || password.length < 6)
+      console.warn('[auth.verify] homeRPC failed, demo fallback:', e.message);
+      if (typeof password !== 'string' || password.length < 6) {
         return res.status(401).json({ error: 'invalid credentials' });
+      }
       userRecord = { email, name: email.split('@')[0] };
     }
 
     const sessId = crypto.randomBytes(24).toString('base64url');
     const exp = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS;
-    sessions.set(sessId, {
-      email: userRecord.email,
-      name: userRecord.name || userRecord.email,
-      exp,
-    });
+    sessions.set(sessId, { email: userRecord.email, name: userRecord.name || userRecord.email, exp });
     setSessCookie(res, sessId, SESSION_TTL_SECONDS);
     res.json({ ok: true });
   } catch (e) {
-    console.error('login-encrypted error', e);
+    console.error('login-plain error', e);
     res.status(500).json({ error: 'server error' });
   }
 });
 
-app.get('/api/me', requireAuth, (req, res) =>
-  res.json({ email: req.user.email, name: req.user.name })
-);
+app.get('/api/me', requireAuth, (req, res) => {
+  res.json({ email: req.user.email, name: req.user.name });
+});
 
 app.get('/api/mail/messages', requireAuth, async (req, res) => {
   const folder = (req.query.folder || 'inbox').toString();
@@ -278,13 +215,7 @@ app.get('/api/mail/messages', requireAuth, async (req, res) => {
     } catch (e) {
       console.warn('[imap.list] homeRPC failed, demo:', e.message);
       items = [
-        {
-          id: 'msg_demo_1',
-          from: 'Alice <alice@example.com>',
-          subject: 'Demo hello',
-          snippet: 'This is a demo message',
-          date: new Date().toISOString(),
-        },
+        { id: 'msg_demo_1', from: 'Alice <alice@example.com>', subject: 'Demo hello', snippet: 'This is a demo message', date: new Date().toISOString() },
       ];
     }
     res.json({ items, nextPage: page + 1 });
@@ -294,14 +225,15 @@ app.get('/api/mail/messages', requireAuth, async (req, res) => {
 });
 
 app.get('/api/mail/messages/:id', requireAuth, async (req, res) => {
+  const id = req.params.id;
   try {
     let msg;
     try {
-      msg = await homeRPC('imap.get', { id: req.params.id, who: req.user.email });
+      msg = await homeRPC('imap.get', { id, who: req.user.email });
     } catch (e) {
       console.warn('[imap.get] homeRPC failed, demo:', e.message);
       msg = {
-        id: req.params.id,
+        id,
         from: 'Alice <alice@example.com>',
         to: [req.user.email],
         subject: 'Demo message',
@@ -317,17 +249,11 @@ app.get('/api/mail/messages/:id', requireAuth, async (req, res) => {
 
 app.post('/api/mail/send', requireAuth, async (req, res) => {
   const { to, subject, body } = req.body || {};
-  if (!to || typeof to !== 'string')
-    return res.status(400).json({ error: 'invalid to' });
+  if (!to || typeof to !== 'string') return res.status(400).json({ error: 'invalid to' });
   try {
     let result;
     try {
-      result = await homeRPC('smtp.send', {
-        from: req.user.email,
-        to,
-        subject: subject || '',
-        body: body || '',
-      });
+      result = await homeRPC('smtp.send', { from: req.user.email, to, subject: subject || '', body: body || '' });
     } catch (e) {
       console.warn('[smtp.send] homeRPC failed, demo:', e.message);
       result = { ok: true, id: 'msg_demo_sent_' + Date.now() };
@@ -346,11 +272,8 @@ app.post('/api/auth/logout', requireAuth, (req, res) => {
 
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 
-// ================= START SERVER =================
-(async () => {
-  await initKeys();
+// ===== start =====
+(function start() {
   connectHomeSockets();
-  http.createServer(app).listen(PORT, () =>
-    console.log(`refnull mail API running on port ${PORT}`)
-  );
+  http.createServer(app).listen(PORT, () => console.log(`refnull mail API running on ${PORT}`));
 })();
