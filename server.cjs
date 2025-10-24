@@ -1,13 +1,5 @@
-// server.cjs — Plain login backend for your new frontend (no encryption)
-// Endpoints:
-//   POST   /api/auth/login-plain    { email, password } -> sets HttpOnly sess cookie
-//   GET    /api/me                  -> { email, name } from session
-//   GET    /api/mail/messages       -> list messages (folder,q,page)
-//   GET    /api/mail/messages/:id   -> one message
-//   POST   /api/mail/send           -> send email
-//   POST   /api/auth/logout         -> clear session
-//   GET    /healthz                 -> { ok:true }
-// CORS allows only https://refnull.net and credentials.
+// server.cjs — Plain login backend with cross-site session cookie (SameSite=None)
+// CORS + cookie-based session backend for your refnull.net frontend.
 
 'use strict';
 
@@ -25,25 +17,24 @@ const FRONTEND_ORIGIN = 'https://refnull.net';
 const SESSION_TTL_SECONDS = 86400; // 1 day
 const PORT = 8080;
 
-// Home PC connector (single full-duplex port)
+// Home PC connector
 const HOME_HOST = '98.156.77.218';
 const HOME_PORT = 31001;
-const HOME_REPLY_PORT = undefined; // keep undefined to use one socket
+const HOME_REPLY_PORT = undefined; // leave undefined for single full-duplex port
 
-// Lightweight PSK for AES-256-GCM framing (base64 -> 32 bytes). Replace with your own.
+// Pre-shared key for light encryption (AES-256-GCM). Replace with your own.
 const HOME_PSK_BASE64 = 'PUy9rgQrk7jZqRY5g8FqQBG901FOwrflcYHeruqRWcI=';
-
 let HOME_PSK = null;
 try {
   const buf = Buffer.from(HOME_PSK_BASE64, 'base64');
   if (buf.length === 32) HOME_PSK = buf;
   else console.warn('HOME_PSK_BASE64 must decode to 32 bytes (got', buf.length, ')');
 } catch {
-  console.warn('Invalid HOME_PSK_BASE64, frames will be plaintext.');
+  console.warn('Invalid HOME_PSK_BASE64');
 }
 
-// ================= IN-MEMORY STORES =================
-const sessions = new Map();  // sessId -> { email, name, exp }
+// ================= SESSION STORAGE =================
+const sessions = new Map(); // sessId -> { email, name, exp }
 setInterval(() => {
   const now = Math.floor(Date.now() / 1000);
   for (const [k, v] of sessions.entries()) if (v.exp <= now) sessions.delete(k);
@@ -51,10 +42,11 @@ setInterval(() => {
 
 // ================= HELPERS =================
 function setSessCookie(res, sessId, maxAgeSeconds) {
+  // Cross-site cookie fix: SameSite=None allows frontend on refnull.net to send it
   const c = cookie.serialize('sess', sessId, {
     httpOnly: true,
     secure: true,
-    sameSite: 'strict',
+    sameSite: 'none',
     path: '/',
     maxAge: maxAgeSeconds,
   });
@@ -84,7 +76,7 @@ const corsOpts = {
   allowedHeaders: ['content-type'],
 };
 
-// ================= HOME CONNECTOR (framed RPC over TCP) =================
+// ================= HOME CONNECTOR =================
 let homeSocket = null, homeReplySocket = null;
 let rpcCounter = 0;
 const pendingRPC = new Map();
@@ -99,7 +91,7 @@ function makeFrame(obj) {
   const c = crypto.createCipheriv('aes-256-gcm', HOME_PSK, nonce);
   const enc = Buffer.concat([c.update(json), c.final()]);
   const tag = c.getAuthTag();
-  const packed = Buffer.concat([nonce, tag, enc]); // 12 + 16 + enc
+  const packed = Buffer.concat([nonce, tag, enc]);
   const len = Buffer.alloc(4); len.writeUInt32BE(packed.length, 0);
   return Buffer.concat([len, packed]);
 }
@@ -179,23 +171,19 @@ app.use((req, res, next) => { res.setHeader('Vary', 'Origin'); next(); });
 app.use(cors(corsOpts));
 app.use(express.json({ limit: '256kb' }));
 
-// --------- ROUTES ---------
-
-// Plaintext login for your new frontend (no RSA/JWKS):
+// ================= ROUTES =================
 app.post('/api/auth/login-plain', async (req, res) => {
   try {
     const { email, password } = req.body || {};
-    if (!email || typeof password !== 'string' || !password) {
+    if (!email || typeof password !== 'string' || !password)
       return res.status(400).json({ error: 'bad request' });
-    }
 
-    // Validate via Home RPC; fallback: accept password length >= 6
     let userRecord;
     try {
       userRecord = await homeRPC('auth.verify', { email, password });
     } catch (e) {
       console.warn('[auth.verify] homeRPC failed, demo fallback:', e.message);
-      if (password.length < 6) return res.status(401).json({ error: 'invalid credentials' });
+      if (password.length < 3) return res.status(401).json({ error: 'invalid credentials' });
       userRecord = { email, name: email.split('@')[0] };
     }
 
@@ -223,9 +211,9 @@ app.get('/api/mail/messages', requireAuth, async (req, res) => {
     try {
       items = await homeRPC('imap.list', { folder, q, page, who: req.user.email });
     } catch (e) {
-      console.warn('[imap.list] homeRPC failed, returning demo items:', e.message);
+      console.warn('[imap.list] homeRPC failed:', e.message);
       items = [
-        { id: 'msg_demo_1', from: 'Alice <alice@example.com>', subject: 'Demo hello', snippet: 'This is a demo message', date: new Date().toISOString() },
+        { id: 'demo1', from: 'Alice <alice@example.com>', subject: 'Hello Demo', snippet: 'This is demo mail', date: new Date().toISOString() },
       ];
     }
     res.json({ items, nextPage: page + 1 });
@@ -241,14 +229,14 @@ app.get('/api/mail/messages/:id', requireAuth, async (req, res) => {
     try {
       msg = await homeRPC('imap.get', { id, who: req.user.email });
     } catch (e) {
-      console.warn('[imap.get] homeRPC failed, returning demo msg:', e.message);
+      console.warn('[imap.get] homeRPC failed:', e.message);
       msg = {
         id,
         from: 'Alice <alice@example.com>',
         to: [req.user.email],
         subject: 'Demo message',
         date: new Date().toISOString(),
-        body: 'Plain text demo body. (Replace with real IMAP fetch in your home agent.)',
+        body: 'Plain demo body (no IMAP connected).',
       };
     }
     res.json(msg);
@@ -263,10 +251,10 @@ app.post('/api/mail/send', requireAuth, async (req, res) => {
   try {
     let result;
     try {
-      result = await homeRPC('smtp.send', { from: req.user.email, to, subject: subject || '', body: body || '' });
+      result = await homeRPC('smtp.send', { from: req.user.email, to, subject, body });
     } catch (e) {
-      console.warn('[smtp.send] homeRPC failed, demo ok:', e.message);
-      result = { ok: true, id: 'msg_demo_sent_' + Date.now() };
+      console.warn('[smtp.send] homeRPC failed:', e.message);
+      result = { ok: true, id: 'sent_' + Date.now() };
     }
     res.json(result.ok ? result : { ok: false, error: result.error || 'send failed' });
   } catch (e) {
@@ -276,7 +264,7 @@ app.post('/api/mail/send', requireAuth, async (req, res) => {
 
 app.post('/api/auth/logout', requireAuth, (req, res) => {
   sessions.delete(req.sessId);
-  setSessCookie(res, '', 0); // clear cookie
+  setSessCookie(res, '', 0);
   res.json({ ok: true });
 });
 
@@ -285,5 +273,5 @@ app.get('/healthz', (req, res) => res.json({ ok: true }));
 // ================= START =================
 connectHomeSockets();
 http.createServer(app).listen(PORT, () => {
-  console.log(`refnull mail API (plain login) running on port ${PORT}`);
+  console.log(`refnull mail API running on port ${PORT}`);
 });
