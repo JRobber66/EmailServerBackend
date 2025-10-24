@@ -21,7 +21,7 @@ const PORT = 8080;
 const HOME_HOST = '98.156.77.218';
 const HOME_PORT = 31001;
 const HOME_REPLY_PORT = undefined;
-const HOME_RPC_TIMEOUT_MS = 5000; // shorter, fail fast
+const HOME_RPC_TIMEOUT_MS = 8000; // shorter, fail fast
 
 // PSK must match your home agent
 const HOME_PSK_BASE64 = 'PUy9rgQrk7jZqRY5g8FqQBG901FOwrflcYHeruqRWcI=';
