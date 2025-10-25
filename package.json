@@ -1,6 +1,7 @@
 {
-  "name": "railway-email-backend",
+  "name": "email-backend",
   "version": "1.0.0",
+  "private": true,
   "type": "commonjs",
   "main": "server.cjs",
   "scripts": {
